@@ -18,6 +18,8 @@ type PgVectorStore struct {
 	pool       *pgxpool.Pool
 	tableName  string
 	dimensions int
+
+	embedder core.Embedder
 }
 
 // PgVectorStoreOpts holds configuration for initializing a PgVectorStore
@@ -25,6 +27,7 @@ type PgVectorStoreOpts struct {
 	ConnectionString string
 	TableName        string
 	Dimensions       int
+	Embedder         core.Embedder
 }
 
 // New creates a new PgVectorStore
@@ -69,6 +72,7 @@ func New(ctx context.Context, config *PgVectorStoreOpts) (*PgVectorStore, error)
 		pool:       pool,
 		tableName:  config.TableName,
 		dimensions: config.Dimensions,
+		embedder:   config.Embedder,
 	}
 
 	// Initialize table
@@ -79,6 +83,12 @@ func New(ctx context.Context, config *PgVectorStoreOpts) (*PgVectorStore, error)
 
 	return store, nil
 }
+
+//// Search finds vectors similar to the query vector
+//Search(ctx context.Context, params *SearchParams) ([]*SearchResult, error)
+
+//// Close releases resources associated with the vector storer
+//Close() error
 
 // initTable creates the vector table if it doesn't exist
 func (s *PgVectorStore) initTable(ctx context.Context) error {
@@ -111,13 +121,13 @@ func (s *PgVectorStore) initTable(ctx context.Context) error {
 }
 
 // Add implements VectorStorer.Add in agent-api/core
-func (s *PgVectorStore) Add(ctx context.Context, vectors []*core.Embedding) error {
+func (s *PgVectorStore) Add(ctx context.Context, contents []string) ([]*core.Embedding, error) {
 	var err error
 
 	// Start a transaction
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("could not begin pool transaction: %w", err)
+		return nil, fmt.Errorf("could not begin pool transaction: %w", err)
 	}
 
 	// Use defer with a named error to handle rollback properly
@@ -126,6 +136,18 @@ func (s *PgVectorStore) Add(ctx context.Context, vectors []*core.Embedding) erro
 			tx.Rollback(ctx)
 		}
 	}()
+
+	// go get the embeddings for each contents and upsert to db
+	embeddings := []*core.Embedding{}
+
+	for _, content := range contents {
+		embedding, err := s.embedder.GenerateEmbedding(ctx, content)
+		if err != nil {
+			panic(err)
+		}
+
+		embeddings = append(embeddings, embedding)
+	}
 
 	// Prepare SQL statement once, outside the loop
 	insertSQL := fmt.Sprintf(`
@@ -139,10 +161,10 @@ func (s *PgVectorStore) Add(ctx context.Context, vectors []*core.Embedding) erro
 	// Prepare batch for efficient insertion
 	batch := &pgx.Batch{}
 
-	for _, cv := range vectors {
+	for _, cv := range embeddings {
 		// Check vector dimensions
 		if len(cv.Vector) != s.dimensions {
-			return fmt.Errorf("vector dimension mismatch: expected %d, got %d", s.dimensions, len(cv.Vector))
+			return nil, fmt.Errorf("vector dimension mismatch: expected %d, got %d", s.dimensions, len(cv.Vector))
 		}
 
 		// Convert to pgvector type
@@ -159,7 +181,7 @@ func (s *PgVectorStore) Add(ctx context.Context, vectors []*core.Embedding) erro
 	for i := range batch.Len() {
 		println("executing batch")
 		if _, err = results.Exec(); err != nil {
-			return fmt.Errorf("error executing batch at index %d: %w", i, err)
+			return nil, fmt.Errorf("error executing batch at index %d: %w", i, err)
 		}
 	}
 
@@ -169,31 +191,35 @@ func (s *PgVectorStore) Add(ctx context.Context, vectors []*core.Embedding) erro
 	// Commit transaction
 	err = tx.Commit(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return nil
+	return embeddings, nil
 }
 
 // Search implements VectorStorer.Search
-func (s *PgVectorStore) Search(ctx context.Context, params core.SearchParams) ([]core.SearchResult, error) {
-	// Validate query vector dimensions
-	if len(params.Query) != s.dimensions {
-		return nil, fmt.Errorf("query vector dimension mismatch: expected %d, got %d", s.dimensions, len(params.Query))
-	}
-
+func (s *PgVectorStore) Search(ctx context.Context, params *core.SearchParams) ([]*core.SearchResult, error) {
 	// Set default limit if not specified
 	limit := params.Limit
 	if limit <= 0 {
 		limit = 10
 	}
 
+	queryVec, err := s.embedder.GenerateEmbedding(ctx, params.Query)
+	if err != nil {
+		panic(err)
+	}
+
+	// Validate query vector dimensions
+	if len(queryVec.Vector) != s.dimensions {
+		return nil, fmt.Errorf("query vector dimension mismatch: expected %d, got %d", s.dimensions, len(params.Query))
+	}
+
 	// Convert query vector to pgvector type
-	queryVec := pgvector.NewVector(params.Query)
+	pgvQueryVec := pgvector.NewVector(queryVec.Vector)
 
 	// Build query with threshold if specified
 	var rows pgx.Rows
-	var err error
 
 	if params.Threshold > 0 {
 		query := fmt.Sprintf(`
@@ -204,7 +230,7 @@ func (s *PgVectorStore) Search(ctx context.Context, params core.SearchParams) ([
 			LIMIT $3
 		`, pgx.Identifier{s.tableName}.Sanitize())
 
-		rows, err = s.pool.Query(ctx, query, queryVec, params.Threshold, limit)
+		rows, err = s.pool.Query(ctx, query, pgvQueryVec, params.Threshold, limit)
 	} else {
 		query := fmt.Sprintf(`
 			SELECT id, vector, content, vector <-> $1 AS distance
@@ -213,7 +239,7 @@ func (s *PgVectorStore) Search(ctx context.Context, params core.SearchParams) ([
 			LIMIT $2
 		`, pgx.Identifier{s.tableName}.Sanitize())
 
-		rows, err = s.pool.Query(ctx, query, queryVec, limit)
+		rows, err = s.pool.Query(ctx, query, pgvQueryVec, limit)
 	}
 
 	if err != nil {
@@ -222,7 +248,7 @@ func (s *PgVectorStore) Search(ctx context.Context, params core.SearchParams) ([
 	defer rows.Close()
 
 	// Process results
-	var results []core.SearchResult
+	results := []*core.SearchResult{}
 	for rows.Next() {
 		var (
 			id       string
@@ -243,11 +269,14 @@ func (s *PgVectorStore) Search(ctx context.Context, params core.SearchParams) ([
 		// Note: This assumes L2 distance and may need adjustment based on your distance metric
 		score := 1.0 - distance
 
-		results = append(results, core.SearchResult{
-			ID:      id,
-			Score:   score,
-			Vector:  vector,
-			Content: content,
+		results = append(results, &core.SearchResult{
+			Score: score,
+			Embedding: &core.Embedding{
+				ID:      id,
+				Vector:  vector,
+				Content: content,
+			},
+			SearchMeta: params,
 		})
 	}
 
@@ -259,8 +288,10 @@ func (s *PgVectorStore) Search(ctx context.Context, params core.SearchParams) ([
 }
 
 // Close releases the pgx connection pool resources
-func (s *PgVectorStore) Close() {
+func (s *PgVectorStore) Close() error {
 	if s.pool != nil {
 		s.pool.Close()
 	}
+
+	return nil
 }
